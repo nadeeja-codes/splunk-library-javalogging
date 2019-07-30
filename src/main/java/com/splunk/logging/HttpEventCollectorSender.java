@@ -18,6 +18,7 @@ package com.splunk.logging;
  * under the License.
  */
 
+import okhttp3.*;
 import org.apache.http.HttpResponse;
 import org.apache.http.client.config.CookieSpecs;
 import org.apache.http.client.config.RequestConfig;
@@ -33,7 +34,9 @@ import org.apache.http.util.EntityUtils;
 
 import org.json.simple.JSONObject;
 
+import javax.net.ssl.HostnameVerifier;
 import javax.net.ssl.SSLContext;
+import javax.net.ssl.SSLSession;
 import java.io.IOException;
 import java.io.Serializable;
 import java.security.cert.X509Certificate;
@@ -94,7 +97,8 @@ public class HttpEventCollectorSender extends TimerTask implements HttpEventColl
     private Timer timer;
     private List<HttpEventCollectorEventInfo> eventsBatch = new LinkedList<HttpEventCollectorEventInfo>();
     private long eventsBatchSize = 0; // estimated total size of events batch
-    private CloseableHttpAsyncClient httpClient;
+    private OkHttpClient httpClient;
+
     private boolean disableCertificateValidation = false;
     private SendMode sendMode = SendMode.Sequential;
     private HttpEventCollectorMiddleware middleware = new HttpEventCollectorMiddleware();
@@ -290,42 +294,22 @@ public class HttpEventCollectorSender extends TimerTask implements HttpEventColl
         int maxConnTotal = sendMode == SendMode.Sequential ? 1 : 0;
         if (! disableCertificateValidation) {
             // create an http client that validates certificates
-            httpClient = HttpAsyncClients.custom()
-                    .setDefaultRequestConfig(RequestConfig.custom().setCookieSpec(CookieSpecs.STANDARD).build())
-                    .setMaxConnTotal(maxConnTotal)
-                    .build();
+            httpClient = new OkHttpClient.Builder().build();
         } else {
             // create strategy that accepts all certificates
-            TrustStrategy acceptingTrustStrategy = new TrustStrategy() {
-                public boolean isTrusted(X509Certificate[] certificate,
-                                         String type) {
+            httpClient = new OkHttpClient.Builder().hostnameVerifier(new HostnameVerifier() {
+                @Override
+                public boolean verify(String s, SSLSession sslSession) {
                     return true;
                 }
-            };
-            SSLContext sslContext = null;
-            try {
-                sslContext = SSLContexts.custom().loadTrustMaterial(
-                        null, acceptingTrustStrategy).build();
-                httpClient = HttpAsyncClients.custom()
-                        .setDefaultRequestConfig(RequestConfig.custom().setCookieSpec(CookieSpecs.STANDARD).build())
-                        .setMaxConnTotal(maxConnTotal)
-                        .setHostnameVerifier(SSLConnectionSocketFactory.ALLOW_ALL_HOSTNAME_VERIFIER)
-                        .setSSLContext(sslContext)
-                        .build();
-            } catch (Exception e) { }
+            }).build();
         }
-        httpClient.start();
     }
 
     // Currently we never close http client. This method is added for symmetry
     // with startHttpClient.
     private void stopHttpClient() throws SecurityException {
-        if (httpClient != null) {
-            try {
-                httpClient.close();
-            } catch (IOException e) { }
-            httpClient = null;
-        }
+        httpClient = null;
     }
 
     private void postEventsAsync(final List<HttpEventCollectorEventInfo> events) {
@@ -368,40 +352,43 @@ public class HttpEventCollectorSender extends TimerTask implements HttpEventColl
         StringBuilder eventsBatchString = new StringBuilder();
         for (HttpEventCollectorEventInfo eventInfo : events)
             eventsBatchString.append(serializeEventInfo(eventInfo));
+
         // create http request
-        final HttpPost httpPost = new HttpPost(url);
-        httpPost.setHeader(
-                AuthorizationHeaderTag,
-                String.format(AuthorizationHeaderScheme, token));
+        RequestBody body = RequestBody.create(MediaType.parse(HttpContentType), eventsBatchString.toString());
+
+        Request.Builder requestBuilder = new Request.Builder()
+                .url(url)
+                .post(body)
+                .addHeader(AuthorizationHeaderTag, String.format(AuthorizationHeaderScheme, token));
+
         if ("Raw".equalsIgnoreCase(type) && channel != null && !channel.trim().equals("")) {
-            httpPost.setHeader(SPLUNKREQUESTCHANNELTag, channel);
+            requestBuilder.addHeader(SPLUNKREQUESTCHANNELTag, channel);
         }
-        StringEntity entity = new StringEntity(eventsBatchString.toString(), encoding);
-        entity.setContentType(HttpContentType);
-        httpPost.setEntity(entity);
-        httpClient.execute(httpPost, new FutureCallback<HttpResponse>() {
+
+        Request request = requestBuilder.build();
+
+        httpClient.newCall(request).enqueue(new Callback() {
             @Override
-            public void completed(HttpResponse response) {
+            public void onFailure(Call call, IOException e) {
+                callback.failed(e);
+            }
+
+            @Override
+            public void onResponse(Call call, Response response) throws IOException {
                 String reply = "";
-                int httpStatusCode = response.getStatusLine().getStatusCode();
+                int httpStatusCode = response.code();
+
                 // read reply only in case of a server error
                 if (httpStatusCode != 200) {
                     try {
-                        reply = EntityUtils.toString(response.getEntity(), encoding);
+                        reply = response.body().string();
                     } catch (IOException e) {
                         reply = e.getMessage();
                     }
                 }
                 callback.completed(httpStatusCode, reply);
-            }
 
-            @Override
-            public void failed(Exception ex) {
-                callback.failed(ex);
             }
-
-            @Override
-            public void cancelled() {}
         });
     }
 }
